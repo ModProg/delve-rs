@@ -1,16 +1,13 @@
-use std::{
-    collections::{HashMap, HashSet},
-    path::Path,
-};
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::path::Path;
 
-use bonsaidb::{
-    core::{
-        connection::Connection,
-        schema::SerializedCollection,
-        transaction::{Operation, Transaction},
-    },
-    local::Database,
-};
+use anyhow::Context;
+use bonsaidb::core::connection::Connection;
+use bonsaidb::core::schema::SerializedCollection;
+use bonsaidb::core::transaction::{Operation, Transaction};
+use bonsaidb::local::Database;
+use pbr::ProgressBar;
 use reqwest::header::LAST_MODIFIED;
 use serde::Deserialize;
 use tantivy::{doc, IndexWriter, Term};
@@ -94,11 +91,17 @@ pub(super) async fn import_continuously(
 }
 
 async fn download(client: reqwest::Client) -> anyhow::Result<(String, String)> {
-    println!("Downloading new dump.");
     let mut response = client
         .get("https://static.crates.io/db-dump.tar.gz")
         .send()
         .await?;
+    let mut pb = ProgressBar::new(
+        response
+            .content_length()
+            .context("response does not have a content length")?,
+    );
+    pb.set_units(pbr::Units::Bytes);
+    pb.message("Downloading new dump: ");
     let last_modified = response
         .headers()
         .get(LAST_MODIFIED)
@@ -113,9 +116,11 @@ async fn download(client: reqwest::Client) -> anyhow::Result<(String, String)> {
         .open("db-dump.tar.gz")
         .await?;
     while let Some(chunk) = response.chunk().await? {
+        pb.add(chunk.len() as u64);
         file.write_all(&chunk).await?;
     }
     drop(file);
+    pb.finish_print("Downloaded dump.");
 
     if !Command::new("/usr/bin/tar")
         .arg("-xzf")
@@ -126,6 +131,8 @@ async fn download(client: reqwest::Client) -> anyhow::Result<(String, String)> {
     {
         anyhow::bail!("error extracting database dump");
     }
+
+    println!("Extracted dump.");
 
     let latest_dump = find_latest_dump(true)
         .await?
@@ -140,9 +147,12 @@ async fn find_latest_dump(allow_stale: bool) -> anyhow::Result<Option<String>> {
     let mut latest_date = None;
     while let Some(entry) = entries.next_entry().await? {
         let file_name = entry.file_name();
-        let Some(file_name) = file_name.to_str() else { continue };
-        let Some(folder_date) = parse_folder_date(file_name)
-            else { continue };
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(folder_date) = parse_folder_date(file_name) else {
+            continue;
+        };
 
         let build_expires_at = folder_date + Duration::days(1);
         if build_expires_at < now || allow_stale {
@@ -262,9 +272,15 @@ fn apply_crate_changes(
     println!("Parsing crate owners.");
     let mut owners = load_crate_owners(data_folder)?;
 
-    println!("Parsing crates.");
-    let mut crates = csv::Reader::from_reader(std::fs::File::open(data_folder.join("crates.csv"))?);
-    for row in crates.deserialize() {
+    let file = std::fs::File::open(data_folder.join("crates.csv"))?;
+    let mut pb = ProgressBar::new(file.metadata()?.len());
+    pb.show_counter = false;
+    pb.show_speed = false;
+    pb.message("Parsing crates: ");
+
+    let mut crates = csv::Reader::from_reader(file).into_deserialize();
+    while let Some(row) = crates.next() {
+        pb.set(crates.reader().position().byte());
         let cr: Crate = row?;
         let id = cr.id;
         let cr = schema::Crate {
@@ -304,6 +320,8 @@ fn apply_crate_changes(
     }
 
     index_writer.commit()?;
+
+    pb.finish_print("Parsed crates.");
 
     Ok(())
 }
@@ -443,9 +461,12 @@ fn apply_version_changes(
         .map(|d| (d.header.id, d))
         .collect::<HashMap<_, _>>();
     let mut version_id_to_crate = HashMap::with_capacity(existing_versions.len());
-    let mut versions =
-        csv::Reader::from_reader(std::fs::File::open(data_folder.join("versions.csv"))?);
-    for row in versions.deserialize() {
+    let file = File::open(data_folder.join("versions.csv"))?;
+    let mut pb = ProgressBar::new(file.metadata()?.len());
+    let mut versions = csv::Reader::from_path(data_folder.join("versions.csv"))?;
+    let mut versions = versions.deserialize();
+    while let Some(row) = versions.next() {
+        pb.set(versions.reader().position().byte());
         let row: Versions = row?;
         version_id_to_crate.insert(row.id, row.crate_id);
         let new = schema::Version {
@@ -476,6 +497,7 @@ fn apply_version_changes(
             )?)?;
         }
     }
+    pb.finish();
 
     Ok(version_id_to_crate)
 }
@@ -531,8 +553,9 @@ fn apply_version_download_changes(
 
 fn parse_iso_date(date: &str) -> anyhow::Result<time::Date> {
     let mut parts = date.split('-');
-    let (Some(year), Some(month), Some(day)) = (parts.next(), parts.next(), parts.next())
-        else { anyhow::bail!("invalid date format") };
+    let (Some(year), Some(month), Some(day)) = (parts.next(), parts.next(), parts.next()) else {
+        anyhow::bail!("invalid date format")
+    };
     let year = year.parse::<i32>()?;
     let month = month.parse::<u8>()?;
     let month = Month::try_from(month)?;

@@ -1,12 +1,11 @@
 use std::{
-    borrow::Cow,
     cmp::Ordering,
     collections::{HashMap, HashSet},
     time::Instant,
 };
 
 use bonsaidb::{
-    core::{connection::StorageConnection, key::Key, schema::SerializedView},
+    core::{connection::StorageConnection, schema::SerializedView},
     local::{
         config::{Builder, StorageConfiguration},
         Database, Storage,
@@ -14,8 +13,9 @@ use bonsaidb::{
 };
 use tantivy::{
     collector::TopDocs,
+    directory::MmapDirectory,
     query::QueryParser,
-    schema::{Field, Schema, Value, FAST, INDEXED, STORED, TEXT},
+    schema::{Field, Value, INDEXED, STORED, TEXT},
     Index,
 };
 
@@ -43,9 +43,12 @@ async fn main() -> anyhow::Result<()> {
     let readme = search_schema.add_text_field("readme", TEXT);
     let search_schema = search_schema.build();
 
-    std::fs::create_dir("delve-rs.bonsaidb/tantivy")?;
+    std::fs::create_dir_all("delve-rs.bonsaidb/tantivy")?;
     let index = SearchIndex {
-        index: Index::create_in_dir("delve-rs.bonsaidb/tantivy", search_schema.clone())?,
+        index: Index::open_or_create(
+            MmapDirectory::open("delve-rs.bonsaidb/tantivy")?,
+            search_schema.clone(),
+        )?,
         id,
         name,
         description,
@@ -53,9 +56,10 @@ async fn main() -> anyhow::Result<()> {
     };
 
     if std::env::args().len() <= 1 {
-        dump::import_continuously(db, cache, index).await?;
+        tokio::task::spawn(dump::import_continuously(db.clone(), cache.clone(), index.clone()));
+        
+        webserver::run(db, cache, index).await?;
         println!("About to exit.");
-        // webserver::run(db, cache, index).await?;
     } else {
         let q = std::env::args().nth(1).expect("length checked");
         let start = Instant::now();
@@ -73,11 +77,6 @@ struct SearchIndex {
     pub name: Field,
     pub description: Field,
     pub readme: Field,
-}
-
-#[derive(Key, Debug, Clone)]
-struct Foo<'k> {
-    string: Cow<'k, str>,
 }
 
 #[derive(Debug)]
@@ -208,7 +207,9 @@ fn query(
 
     // Adjust the scores based on percentage of downloads across these search results.
     for (confidence, popularity, id) in &mut results {
-        let Some(c) = all_crates.get(id) else { continue };
+        let Some(c) = all_crates.get(id) else {
+            continue;
+        };
 
         // Adjust confidence to be a percentage of the highest crate
         *confidence /= maximum_confidence;
@@ -237,7 +238,9 @@ fn query(
 
     let mut final_results = Vec::with_capacity(results.len());
     for (confidence, popularity, id) in results {
-        let Some(c) = all_crates.remove(&id) else { continue };
+        let Some(c) = all_crates.remove(&id) else {
+            continue;
+        };
         final_results.push(CrateResult {
             confidence,
             popularity,
